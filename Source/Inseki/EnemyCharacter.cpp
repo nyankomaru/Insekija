@@ -1,10 +1,15 @@
 #include "EnemyCharacter.h"
+
 #include "Animation/AnimInstance.h"
 #include "Animation/AnimMontage.h"
-#include "GameFramework/CharacterMovementComponent.h"
 #include "Components/CapsuleComponent.h"
 #include "Components/SkeletalMeshComponent.h"
+#include "GameFramework/CharacterMovementComponent.h"
 #include "Kismet/GameplayStatics.h"
+
+// ==================================================
+// Constructor / Initialize
+// ==================================================
 
 AEnemyCharacter::AEnemyCharacter()
 {
@@ -15,6 +20,10 @@ AEnemyCharacter::AEnemyCharacter()
 
 	GetCharacterMovement()->DefaultLandMovementMode = MOVE_Walking;
 	GetCharacterMovement()->bOrientRotationToMovement = false;
+	GetCharacterMovement()->bCanWalkOffLedges = true;
+
+	GetCharacterMovement()->JumpZVelocity = 450.0f;
+	GetCharacterMovement()->AirControl = 0.8f;
 }
 
 void AEnemyCharacter::BeginPlay()
@@ -32,6 +41,173 @@ void AEnemyCharacter::BeginPlay()
 
 	EnterIdleState();
 }
+
+// ==================================================
+// Tick / Main Update
+// ==================================================
+
+void AEnemyCharacter::Tick(float DeltaTime)
+{
+	Super::Tick(DeltaTime);
+
+	const bool bIsCurrentlyFalling = GetCharacterMovement()->IsFalling();
+
+	// 段差から落ち始めた瞬間を検出する
+	if (bIsCurrentlyFalling && !bWasFallingLastFrame)
+	{
+		// 自発ジャンプではない落下 = 段差落下として扱う
+		if (!bEnemyJumpStarted)
+		{
+			bLedgeFallDetected = true;
+			UE_LOG(LogTemp, Warning, TEXT("Enemy ledge fall detected"));
+		}
+	}
+
+	bWasFallingLastFrame = bIsCurrentlyFalling;
+
+	// 行動不能状態ではAI更新しない
+	if (!TargetPlayer || bIsDead || bIsRespawning)
+	{
+		return;
+	}
+
+	const float Distance = FVector::Dist(GetActorLocation(), TargetPlayer->GetActorLocation());
+
+	// 攻撃距離内なら移動を止めて攻撃
+	if (Distance <= AttackDistance)
+	{
+		GetCharacterMovement()->StopMovementImmediately();
+		TryAttack();
+		return;
+	}
+
+	// 追跡距離内なら移動とジャンプ判断を行う
+	if (Distance <= ChaseDistance)
+	{
+		MoveToPlayer(DeltaTime);
+		TryJumpToTarget();
+		return;
+	}
+}
+
+// ==================================================
+// AI Behavior
+// ==================================================
+
+void AEnemyCharacter::MoveToPlayer(float DeltaTime)
+{
+	if (!TargetPlayer)
+	{
+		return;
+	}
+
+	FVector Direction = TargetPlayer->GetActorLocation() - GetActorLocation();
+	Direction.Z = 0.0f;
+
+	if (!Direction.Normalize())
+	{
+		return;
+	}
+
+	UE_LOG(LogTemp, Warning, TEXT("Direction = %s"), *Direction.ToString());
+
+	GetCharacterMovement()->SetMovementMode(MOVE_Walking);
+	GetCharacterMovement()->MaxWalkSpeed = MoveSpeed;
+
+	AddMovementInput(Direction, 1.0f, true);
+
+	const FRotator LookAtRotation = Direction.Rotation();
+	SetActorRotation(FRotator(0.0f, LookAtRotation.Yaw + 180.0f, 0.0f));
+}
+
+void AEnemyCharacter::TryAttack()
+{
+	if (!bCanAttack)
+	{
+		return;
+	}
+
+	bCanAttack = false;
+
+	UE_LOG(LogTemp, Warning, TEXT("Enemy Attack"));
+
+	PlayAttackMontage();
+
+	GetWorldTimerManager().SetTimer(
+		AttackCooldownTimer,
+		[this]()
+		{
+			bCanAttack = true;
+		},
+		AttackInterval,
+		false
+	);
+}
+
+void AEnemyCharacter::PlayAttackMontage()
+{
+	UAnimInstance* AnimInstance = GetMesh() ? GetMesh()->GetAnimInstance() : nullptr;
+	if (!AnimInstance || !AttackMontage)
+	{
+		return;
+	}
+
+	AnimInstance->Montage_Play(AttackMontage);
+}
+
+void AEnemyCharacter::TryJumpToTarget()
+{
+	if (!TargetPlayer || !bCanJumpToTarget)
+	{
+		return;
+	}
+
+	// 段差落下後のロック中はジャンプ禁止
+	if (bJumpLockedAfterLedgeFall)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Jump blocked: ledge-fall lock"));
+		return;
+	}
+
+	// 空中ではジャンプしない
+	if (!GetCharacterMovement()->IsMovingOnGround())
+	{
+		return;
+	}
+
+	const float HeightDelta = TargetPlayer->GetActorLocation().Z - GetActorLocation().Z;
+	const float HorizontalDistance = FVector::Dist2D(
+		GetActorLocation(),
+		TargetPlayer->GetActorLocation()
+	);
+
+	UE_LOG(LogTemp, Warning, TEXT("HeightDelta = %f / HorizontalDistance = %f"), HeightDelta, HorizontalDistance);
+
+	// プレイヤーが一定以上上にいて、かつ近距離にいる時のみジャンプする
+	if (HeightDelta > JumpHeightThreshold && HorizontalDistance < 120.0f)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Enemy Jump!"));
+
+		bEnemyJumpStarted = true;
+		bCanJumpToTarget = false;
+
+		Jump();
+
+		GetWorldTimerManager().SetTimer(
+			JumpCooldownTimer,
+			[this]()
+			{
+				bCanJumpToTarget = true;
+			},
+			JumpCooldown,
+			false
+		);
+	}
+}
+
+// ==================================================
+// Damage
+// ==================================================
 
 void AEnemyCharacter::ReceiveAttackDamage(float DamageAmount)
 {
@@ -88,6 +264,10 @@ void AEnemyCharacter::ReceiveAttackDamage(float DamageAmount)
 		EnterDamageState();
 	}
 }
+
+// ==================================================
+// State Transition
+// ==================================================
 
 void AEnemyCharacter::EnterIdleState()
 {
@@ -177,6 +357,10 @@ void AEnemyCharacter::EnterBlowawayState()
 	);
 }
 
+// ==================================================
+// Animation Callback
+// ==================================================
+
 void AEnemyCharacter::OnDamageMontageEnded(UAnimMontage* Montage, bool bInterrupted)
 {
 	if (bIsDead)
@@ -194,6 +378,10 @@ void AEnemyCharacter::OnDamageMontageEnded(UAnimMontage* Montage, bool bInterrup
 		AnimInstance->OnMontageEnded.RemoveDynamic(this, &AEnemyCharacter::OnDamageMontageEnded);
 	}
 }
+
+// ==================================================
+// Respawn Sequence
+// ==================================================
 
 void AEnemyCharacter::StartDeathBlink()
 {
@@ -325,90 +513,36 @@ void AEnemyCharacter::FinishRespawn()
 	EnterIdleState();
 }
 
-void AEnemyCharacter::Tick(float DeltaTime)
+// ==================================================
+// Landing Event
+// ==================================================
+
+void AEnemyCharacter::Landed(const FHitResult& Hit)
 {
-	Super::Tick(DeltaTime);
+	Super::Landed(Hit);
 
-	UE_LOG(LogTemp, Warning, TEXT("Enemy Tick"));
+	// 自発ジャンプ状態を解除
+	bEnemyJumpStarted = false;
+	bWasFallingLastFrame = false;
 
-	if (!TargetPlayer || bIsDead || bIsRespawning)
+	// 段差落下後の着地時は一定時間ジャンプを禁止する
+	if (bLedgeFallDetected)
 	{
-		return;
+		bLedgeFallDetected = false;
+		bJumpLockedAfterLedgeFall = true;
+
+		UE_LOG(LogTemp, Warning, TEXT("Enemy landed after ledge fall -> jump locked"));
+
+		GetWorldTimerManager().ClearTimer(LedgeFallJumpLockTimer);
+		GetWorldTimerManager().SetTimer(
+			LedgeFallJumpLockTimer,
+			[this]()
+			{
+				bJumpLockedAfterLedgeFall = false;
+				UE_LOG(LogTemp, Warning, TEXT("Enemy jump lock released"));
+			},
+			LedgeFallJumpLockTime,
+			false
+		);
 	}
-
-	const float Distance = FVector::Dist(GetActorLocation(), TargetPlayer->GetActorLocation());
-	UE_LOG(LogTemp, Warning, TEXT("Distance = %f"), Distance);
-
-	if (Distance <= AttackDistance)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("TryAttack"));
-		TryAttack();
-		return;
-	}
-
-	if (Distance <= ChaseDistance)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("MoveToPlayer"));
-		MoveToPlayer(DeltaTime);
-		return;
-	}
-}
-
-void AEnemyCharacter::MoveToPlayer(float DeltaTime)
-{
-	if (!TargetPlayer)
-	{
-		return;
-	}
-
-	FVector Direction = TargetPlayer->GetActorLocation() - GetActorLocation();
-	Direction.Z = 0.0f;
-
-	if (!Direction.Normalize())
-	{
-		return;
-	}
-
-	UE_LOG(LogTemp, Warning, TEXT("Direction = %s"), *Direction.ToString());
-
-	GetCharacterMovement()->SetMovementMode(MOVE_Walking);
-	GetCharacterMovement()->MaxWalkSpeed = MoveSpeed;
-
-	AddMovementInput(Direction, 1.0f, true);
-
-	const FRotator LookAtRotation = Direction.Rotation();
-	SetActorRotation(FRotator(0.0f, LookAtRotation.Yaw, 0.0f));
-}
-
-void AEnemyCharacter::TryAttack()
-{
-	if (!bCanAttack) return;
-
-	bCanAttack = false;
-
-	UE_LOG(LogTemp, Warning, TEXT("Enemy Attack"));
-
-	PlayAttackMontage();
-
-	GetWorldTimerManager().SetTimer(
-		AttackCooldownTimer,
-		[this]()
-		{
-			bCanAttack = true;
-		},
-		AttackInterval,
-		false
-	);
-}
-
-void AEnemyCharacter::PlayAttackMontage()
-{
-	UAnimInstance* Anim = GetMesh()->GetAnimInstance();
-
-	if (!Anim || !AttackMontage)
-	{
-		return;
-	}
-
-	Anim->Montage_Play(AttackMontage);
 }

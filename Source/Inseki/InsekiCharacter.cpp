@@ -1,20 +1,25 @@
 ﻿// Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "InsekiCharacter.h"
-#include "Engine/LocalPlayer.h"
-#include "Camera/CameraComponent.h"
-#include "Components/CapsuleComponent.h"
-#include "GameFramework/CharacterMovementComponent.h"
-#include "GameFramework/SpringArmComponent.h"
-#include "GameFramework/Controller.h"
-#include "EnhancedInputComponent.h"
-#include "EnhancedInputSubsystems.h"
-#include "InputActionValue.h"
+
 #include "Animation/AnimInstance.h"
 #include "Animation/AnimMontage.h"
-#include "Inseki.h"
+#include "Camera/CameraComponent.h"
+#include "Components/CapsuleComponent.h"
+#include "Engine/LocalPlayer.h"
+#include "EnhancedInputComponent.h"
+#include "EnhancedInputSubsystems.h"
 #include "EnemyCharacter.h"
+#include "GameFramework/CharacterMovementComponent.h"
+#include "GameFramework/Controller.h"
+#include "GameFramework/SpringArmComponent.h"
+#include "InputActionValue.h"
+#include "Inseki.h"
 #include "Kismet/KismetSystemLibrary.h"
+
+// ==================================================
+// Constructor / Initialize
+// ==================================================
 
 AInsekiCharacter::AInsekiCharacter()
 {
@@ -33,7 +38,6 @@ AInsekiCharacter::AInsekiCharacter()
 	GetCharacterMovement()->MaxWalkSpeed = 380.f;
 	GetCharacterMovement()->MinAnalogWalkSpeed = 20.f;
 	GetCharacterMovement()->AirControl = 1.0f;
-	GetCharacterMovement()->MaxWalkSpeed = 380.f;
 	GetCharacterMovement()->MaxAcceleration = 1400.f;
 	GetCharacterMovement()->BrakingDecelerationWalking = 1200.f;
 	GetCharacterMovement()->BrakingDecelerationFalling = 0.0f;
@@ -50,12 +54,36 @@ AInsekiCharacter::AInsekiCharacter()
 	FollowCamera->bUsePawnControlRotation = false;
 }
 
+void AInsekiCharacter::BeginPlay()
+{
+	Super::BeginPlay();
+
+	GetCharacterMovement()->GravityScale = NormalGravityScale;
+	GetCharacterMovement()->JumpZVelocity = JumpVerticalVelocity;
+
+	VisualYaw = RightFacingYaw;
+	FacingSign = 1.0f;
+	TurnTargetYaw = RightFacingYaw;
+	PendingFacingSign = 1.0f;
+
+	SetActorRotation(FRotator(0.0f, VisualYaw, 0.0f));
+
+	if (UAnimInstance* Anim = GetMesh()->GetAnimInstance())
+	{
+		Anim->OnPlayMontageNotifyBegin.AddDynamic(this, &AInsekiCharacter::OnMontageNotifyBegin);
+	}
+}
+
+// ==================================================
+// Tick / Main Update
+// ==================================================
+
 void AInsekiCharacter::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
 
 	// -----------------------------
-	// コヨーテタイム
+	// Coyote Time
 	// -----------------------------
 	if (GetCharacterMovement()->IsMovingOnGround())
 	{
@@ -67,7 +95,7 @@ void AInsekiCharacter::Tick(float DeltaTime)
 	}
 
 	// -----------------------------
-	// ジャンプバッファ
+	// Jump Buffer
 	// -----------------------------
 	if (JumpBufferTimer > 0.0f)
 	{
@@ -81,7 +109,7 @@ void AInsekiCharacter::Tick(float DeltaTime)
 	}
 
 	// -----------------------------
-	// ジャンプ重力制御
+	// Jump Gravity Control
 	// -----------------------------
 	const bool bIsCurrentlyFalling = GetCharacterMovement()->IsFalling();
 
@@ -89,21 +117,24 @@ void AInsekiCharacter::Tick(float DeltaTime)
 	{
 		const float Z = GetVelocity().Z;
 
-		// 上昇
+		// 上昇中
 		if (Z > 20.0f)
 		{
 			GetCharacterMovement()->GravityScale = JumpRiseGravityScale;
 		}
-		// 頂点付近～落下開始
+		// 頂点付近 ～ 落下中
 		else
 		{
 			GetCharacterMovement()->GravityScale = JumpFallGravityScale;
 		}
 	}
 
-	// 足場落下検出
+	// -----------------------------
+	// Ledge Fall Detection
+	// -----------------------------
 	if (bIsCurrentlyFalling && !bWasFallingLastFrame)
 	{
+		// ジャンプ由来でない落下は段差落下として扱う
 		if (!bIsJumpFalling)
 		{
 			FVector Velocity = GetCharacterMovement()->Velocity;
@@ -115,7 +146,7 @@ void AInsekiCharacter::Tick(float DeltaTime)
 	bWasFallingLastFrame = bIsCurrentlyFalling;
 
 	// -----------------------------
-	// StartMove解除後の入力立ち上がり
+	// Move Start Release Blend
 	// -----------------------------
 	const float TargetReleaseBlend = bMoveStartLocked ? 0.0f : 1.0f;
 	MoveStartReleaseBlend = FMath::FInterpTo(
@@ -126,7 +157,7 @@ void AInsekiCharacter::Tick(float DeltaTime)
 	);
 
 	// -----------------------------
-	// 回転補間
+	// Turn Interpolation
 	// -----------------------------
 	if (bIsTurning)
 	{
@@ -149,10 +180,14 @@ void AInsekiCharacter::Tick(float DeltaTime)
 	}
 
 	// -----------------------------
-	// 空中攻撃予約：頂点で発動
+	// Queued Air Attack
 	// -----------------------------
 	TryExecuteQueuedAirAttackAtApex();
 }
+
+// ==================================================
+// Input Binding
+// ==================================================
 
 void AInsekiCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
 {
@@ -184,6 +219,10 @@ void AInsekiCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputCom
 		UE_LOG(LogInseki, Error, TEXT("'%s' Enhanced Inputコンポーネントの取得に失敗しました。"), *GetNameSafe(this));
 	}
 }
+
+// ==================================================
+// Facing / Turn System
+// ==================================================
 
 void AInsekiCharacter::StartTurnToSign(float NewFacingSign)
 {
@@ -220,7 +259,7 @@ void AInsekiCharacter::UpdateTurnFromInput(float RightInput)
 
 	const float InputSign = FMath::Sign(RightInput);
 
-	// ターン中なら最終的に向かっている方向を見る
+	// ターン中なら、最終的に向く予定の方向を現在向きとして扱う
 	const float CurrentOrPendingSign = bIsTurning ? PendingFacingSign : FacingSign;
 
 	if (InputSign != CurrentOrPendingSign)
@@ -229,11 +268,96 @@ void AInsekiCharacter::UpdateTurnFromInput(float RightInput)
 	}
 }
 
+// ==================================================
+// Movement Input
+// ==================================================
+
 void AInsekiCharacter::Move(const FInputActionValue& Value)
 {
 	const FVector2D MovementVector = Value.Get<FVector2D>();
 	DoMove(MovementVector.X, MovementVector.Y);
 }
+
+void AInsekiCharacter::DoMove(float Right, float Forward)
+{
+	const bool bIsAirborne = GetCharacterMovement()->IsFalling();
+	const bool bShouldBlockMoveByAttack = bIsAttacking && !bIsAirborne;
+
+	if (bShouldBlockMoveByAttack || bLandingLock)
+	{
+		bHasMoveInput = false;
+		return;
+	}
+
+	if (GetController() == nullptr)
+	{
+		bHasMoveInput = false;
+		return;
+	}
+
+	const FVector WorldRightDirection = FVector(0.0f, 1.0f, 0.0f);
+
+	bHasMoveInput = !FMath::IsNearlyZero(Right, MoveInputDeadZone);
+
+	if (bHasMoveInput)
+	{
+		LastMoveInput = FMath::Sign(Right);
+		UpdateTurnFromInput(Right);
+	}
+
+	// -----------------------------
+	// Ground Movement
+	// -----------------------------
+	if (!GetCharacterMovement()->IsFalling())
+	{
+		const float CurrentSpeed2D = FVector(GetVelocity().X, GetVelocity().Y, 0.0f).Size();
+
+		if (bHasMoveInput &&
+			CurrentSpeed2D < MoveStartSpeedThreshold &&
+			!bIsMoveStarting &&
+			!bMoveStartLocked &&
+			!bMoveStartConsumed)
+		{
+			BeginMoveStart();
+		}
+
+		if (!bHasMoveInput)
+		{
+			ResetMoveStartState();
+		}
+
+		if (bMoveStartLocked)
+		{
+			FVector Velocity = GetCharacterMovement()->Velocity;
+			Velocity.Y = 0.0f;
+			GetCharacterMovement()->Velocity = Velocity;
+			return;
+		}
+
+		AddMovementInput(WorldRightDirection, Right * MoveStartReleaseBlend);
+		return;
+	}
+
+	// -----------------------------
+	// Air Movement
+	// -----------------------------
+	FVector Velocity = GetCharacterMovement()->Velocity;
+	Velocity.Y = Right * GetCharacterMovement()->MaxWalkSpeed * JumpAirMoveScale;
+	GetCharacterMovement()->Velocity = Velocity;
+}
+
+void AInsekiCharacter::DoLook(float Yaw, float Pitch)
+{
+	if (GetController() != nullptr)
+	{
+		AddControllerYawInput(Yaw);
+		AddControllerPitchInput(Pitch);
+	}
+}
+
+// ==================================================
+// Move Start Control
+// ==================================================
 
 void AInsekiCharacter::BeginMoveStart()
 {
@@ -274,78 +398,10 @@ void AInsekiCharacter::UnlockMoveStart()
 	bMoveStartLocked = false;
 	bIsMoveStarting = false;
 }
-void AInsekiCharacter::DoMove(float Right, float Forward)
-{
-	const bool bIsAirborne = GetCharacterMovement()->IsFalling();
-	const bool bShouldBlockMoveByAttack = bIsAttacking && !bIsAirborne;
 
-	if (bShouldBlockMoveByAttack || bLandingLock)
-	{
-		bHasMoveInput = false;
-		return;
-	}
-
-	if (GetController() == nullptr)
-	{
-		bHasMoveInput = false;
-		return;
-	}
-
-	const FVector WorldRightDirection = FVector(0.0f, 1.0f, 0.0f);
-
-	bHasMoveInput = !FMath::IsNearlyZero(Right, MoveInputDeadZone);
-
-	if (bHasMoveInput)
-	{
-		LastMoveInput = FMath::Sign(Right);
-		UpdateTurnFromInput(Right);
-	}
-
-	// 地上
-	if (!GetCharacterMovement()->IsFalling())
-	{
-		const float CurrentSpeed2D = FVector(GetVelocity().X, GetVelocity().Y, 0.0f).Size();
-
-		if (bHasMoveInput &&
-			CurrentSpeed2D < MoveStartSpeedThreshold &&
-			!bIsMoveStarting &&
-			!bMoveStartLocked &&
-			!bMoveStartConsumed)
-		{
-			BeginMoveStart();
-		}
-
-		if (!bHasMoveInput)
-		{
-			ResetMoveStartState();
-		}
-
-		if (bMoveStartLocked)
-		{
-			FVector Velocity = GetCharacterMovement()->Velocity;
-			Velocity.Y = 0.0f;
-			GetCharacterMovement()->Velocity = Velocity;
-			return;
-		}
-
-		AddMovementInput(WorldRightDirection, Right * MoveStartReleaseBlend);
-		return;
-	}
-
-	// 空中
-	FVector Velocity = GetCharacterMovement()->Velocity;
-	Velocity.Y = Right * GetCharacterMovement()->MaxWalkSpeed * JumpAirMoveScale;
-	GetCharacterMovement()->Velocity = Velocity;
-}
-
-void AInsekiCharacter::DoLook(float Yaw, float Pitch)
-{
-	if (GetController() != nullptr)
-	{
-		AddControllerYawInput(Yaw);
-		AddControllerPitchInput(Pitch);
-	}
-}
+// ==================================================
+// Jump System
+// ==================================================
 
 void AInsekiCharacter::DoJumpStart()
 {
@@ -354,6 +410,7 @@ void AInsekiCharacter::DoJumpStart()
 		return;
 	}
 
+	// 通常ジャンプ不可状態ならバッファだけ残す
 	if (GetCharacterMovement()->IsFalling() && CoyoteTimer <= 0.0f)
 	{
 		JumpBufferTimer = JumpBufferTime;
@@ -368,7 +425,7 @@ void AInsekiCharacter::DoJumpStart()
 	bIsJumpFalling = true;
 	bJumpHeld = true;
 
-	// 地上の横速度を引き継ぎたくないなら消す
+	// 地上の横速度は引き継がない
 	FVector Velocity = GetCharacterMovement()->Velocity;
 	Velocity.Y = 0.0f;
 	GetCharacterMovement()->Velocity = Velocity;
@@ -376,9 +433,21 @@ void AInsekiCharacter::DoJumpStart()
 	// 上昇開始時の重力
 	GetCharacterMovement()->GravityScale = JumpRiseGravityScale;
 
-	// 真上ジャンプのみ
+	// 真上ジャンプ
 	const FVector LaunchVelocity(0.0f, 0.0f, JumpVerticalVelocity);
 	LaunchCharacter(LaunchVelocity, false, true);
+}
+
+void AInsekiCharacter::DoJumpEnd()
+{
+	bJumpHeld = false;
+	StopJumping();
+
+	// 上昇中に離したら早めに落とす
+	if (GetCharacterMovement()->IsFalling() && GetVelocity().Z > 0.0f)
+	{
+		GetCharacterMovement()->GravityScale = JumpFallGravityScale;
+	}
 }
 
 void AInsekiCharacter::Landed(const FHitResult& Hit)
@@ -393,7 +462,7 @@ void AInsekiCharacter::Landed(const FHitResult& Hit)
 
 	ResetMoveStartState();
 
-	// パンチ予約をクリア
+	// パンチ連打予約をクリア
 	bPunchQueued = false;
 	bCanQueueNextPunch = false;
 
@@ -409,17 +478,10 @@ void AInsekiCharacter::Landed(const FHitResult& Hit)
 		false
 	);
 }
-void AInsekiCharacter::DoJumpEnd()
-{
-	bJumpHeld = false;
-	StopJumping();
 
-	// 上昇中に離したら少し早めに落とす
-	if (GetCharacterMovement()->IsFalling() && GetVelocity().Z > 0.0f)
-	{
-		GetCharacterMovement()->GravityScale = JumpFallGravityScale;
-	}
-}
+// ==================================================
+// Attack Input
+// ==================================================
 
 void AInsekiCharacter::OnPunchPressed()
 {
@@ -429,7 +491,7 @@ void AInsekiCharacter::OnPunchPressed()
 		return;
 	}
 
-	// すでにパンチ中なら、次段を予約
+	// パンチ中なら次段入力だけ予約する
 	if (bIsAttacking && CurrentAttackType == EAttackType::Punch)
 	{
 		if (bCanQueueNextPunch)
@@ -477,6 +539,10 @@ void AInsekiCharacter::OnKickPressed()
 		return;
 	}
 }
+
+// ==================================================
+// Attack Start / Combo
+// ==================================================
 
 void AInsekiCharacter::StartPunchAttack()
 {
@@ -577,6 +643,7 @@ bool AInsekiCharacter::TryStartAttack(const FAttackData& AttackData)
 
 	bAttackStartedInAir = GetCharacterMovement()->IsFalling();
 
+	// 地上攻撃時のみその場で停止させる
 	if (!bAttackStartedInAir)
 	{
 		GetCharacterMovement()->StopMovementImmediately();
@@ -633,6 +700,10 @@ void AInsekiCharacter::ClosePunchQueueWindow()
 	bCanQueueNextPunch = false;
 }
 
+// ==================================================
+// Air Attack Control
+// ==================================================
+
 bool AInsekiCharacter::IsRisingInAir() const
 {
 	return GetCharacterMovement()->IsFalling() && GetVelocity().Z > AirAttackApexThresholdZ;
@@ -656,13 +727,13 @@ void AInsekiCharacter::TryExecuteQueuedAirAttackAtApex()
 		return;
 	}
 
-	// まだ上昇中なら出さない
+	// まだ上昇前・上昇扱いなら出さない
 	if (!GetCharacterMovement()->IsFalling())
 	{
 		return;
 	}
 
-	// 頂点付近～落下開始に入ったら出す
+	// 頂点付近 ～ 落下開始で発動
 	if (GetVelocity().Z <= AirAttackApexThresholdZ)
 	{
 		const FAttackData AttackData = QueuedAirAttackData;
@@ -673,25 +744,9 @@ void AInsekiCharacter::TryExecuteQueuedAirAttackAtApex()
 	}
 }
 
-void AInsekiCharacter::BeginPlay()
-{
-	Super::BeginPlay();
-
-	GetCharacterMovement()->GravityScale = NormalGravityScale;
-	GetCharacterMovement()->JumpZVelocity = JumpVerticalVelocity;
-
-	VisualYaw = RightFacingYaw;
-	FacingSign = 1.0f;
-	TurnTargetYaw = RightFacingYaw;
-	PendingFacingSign = 1.0f;
-
-	SetActorRotation(FRotator(0.0f, VisualYaw, 0.0f));
-
-	if (UAnimInstance* Anim = GetMesh()->GetAnimInstance())
-	{
-		Anim->OnPlayMontageNotifyBegin.AddDynamic(this, &AInsekiCharacter::OnMontageNotifyBegin);
-	}
-}
+// ==================================================
+// Animation Notify / Attack Hit Check
+// ==================================================
 
 void AInsekiCharacter::OnMontageNotifyBegin(FName NotifyName, const FBranchingPointNotifyPayload& Payload)
 {
@@ -734,7 +789,8 @@ void AInsekiCharacter::BeginAttackHitCheck()
 		HitOffset = KickHitOffset;
 	}
 
-	const FVector Center = GetActorLocation()
+	const FVector Center =
+		GetActorLocation()
 		+ GetActorForwardVector() * HitOffset.X
 		+ GetActorRightVector() * HitOffset.Y
 		+ GetActorUpVector() * HitOffset.Z;
@@ -752,7 +808,7 @@ void AInsekiCharacter::BeginAttackHitCheck()
 		UEngineTypes::ConvertToTraceType(ECC_Pawn),
 		false,
 		IgnoreActors,
-		EDrawDebugTrace::None,   // ←ここ変更
+		EDrawDebugTrace::None,
 		HitResults,
 		true
 	);
